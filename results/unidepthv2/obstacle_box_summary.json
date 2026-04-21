@@ -1,0 +1,6 @@
+{
+  "num_boxes": 1959,
+  "mae_min_depth_m": 0.7492370438505764,
+  "rmse_min_depth_m": 1.937337474215776,
+  "abs_rel_min_depth": 3.653079963304526
+}

@@ -1,0 +1,37 @@
+# Model weights
+Weights/
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# Dataset
+NUsCENES_DATASET/
+data/
+
+# Virtual environments
+venv*/
+.venv/
+DA3/
+Uni/
+M3D/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Large per-frame result files (not needed for reproducibility)
+per_frame_metrics.csv
+obstacle_box_metrics.csv
+
+# Frame visualisation outputs
+frames/
+
+# Video outputs
+*.mp4
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
