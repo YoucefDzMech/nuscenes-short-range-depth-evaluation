@@ -1,6 +1,7 @@
 {
-  "num_boxes": 1656,
-  "mae_min_depth_m": 0.9145783769542685,
-  "rmse_min_depth_m": 1.689010083984062,
-  "abs_rel_min_depth": 6.487915939397411
+  "num_boxes": 2371,
+  "mae_min_depth_m": 0.89731312,
+  "rmse_min_depth_m": 4.477,
+  "median_min_depth_m": 0.22990227,
+  "note": "Box AbsRel omitted: near-zero GT at object level makes it an uninformative artefact."
 }

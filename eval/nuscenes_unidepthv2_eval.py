@@ -1,757 +1,392 @@
-import argparse
-import json
-import os
+"""
+UniDepthV2 — Consistent re-evaluation script
+=============================================
+Camera  : CAM_FRONT  (no bumper obstruction)
+Frames  : ALL keyframes on disk (~3367)  — no YOLO gate on metrics
+Metrics : pixel-level MAE/RMSE/AbsRel at LiDAR GT pixels 0.1–5m
+YOLO    : runs AFTER inference, visualization only (boxes on composite PNG)
+Output  : D:\\RVC_Model'sOutput\\UnidepthV2\\CAM_FRONT_all_frames_5m\\runN\\
+
+Run:
+  & "C:\\RVC\\UnidepthV2\\Uni\\Scripts\\Activate.ps1"
+  python nuscenes_unidepthv2_camfront_eval.py
+  python nuscenes_unidepthv2_camfront_eval.py --max-samples 100   # quick test
+"""
+
+import argparse, bisect, json, os, sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import cv2
-import matplotlib
-import numpy as np
-import pandas as pd
-import torch
+import cv2, matplotlib, numpy as np, pandas as pd, torch
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
 from pyquaternion import Quaternion
 from safetensors.torch import load_file as load_safetensors_file
 from tabulate import tabulate
-from ultralytics import YOLO
 
+sys.path.insert(0, os.environ.get("UNIDEPTH_REPO", "path/to/UniDepth"))  # official model repo (not included)
 from unidepth.models import UniDepthV2
 from unidepth.utils.camera import Pinhole
 
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_CKPT   = "path/to/unidepth-v2-vitl14/model.safetensors"
+DEFAULT_CFG    = "path/to/unidepth-v2-vitl14/config.json"
+DEFAULT_YOLO   = os.environ.get("YOLO_WEIGHTS", "yolo26s.pt")
+DEFAULT_OUTDIR = "outputs/unidepthv2_CAM_FRONT_5m"
+DATAROOT       = os.environ.get("NUSCENES_DATAROOT", "path/to/nuscenes/trainval02")
 
 @dataclass
 class FrameMetrics:
     sample_token: str
-    camera_token: str
-    lidar_token: str
     valid_pixels: int
     mae_m: float
     rmse_m: float
     abs_rel: float
 
+# ── Device ────────────────────────────────────────────────────────────────────
+def get_device():
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda:0")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_sample_tokens(nusc: NuScenes, camera: str, lidar: str, max_samples: int) -> List[str]:
-    tokens: List[str] = []
-    for scene in nusc.scene:
-        token = scene["first_sample_token"]
-        while token:
-            sample = nusc.get("sample", token)
-            if camera in sample["data"] and lidar in sample["data"]:
-                tokens.append(token)
-            token = sample["next"]
-            if max_samples > 0 and len(tokens) >= max_samples:
-                return tokens
-    return tokens
-
-
-def load_unidepthv2_model(checkpoint_path: str, config_path: str, device: torch.device) -> UniDepthV2:
-    with open(config_path, "r", encoding="utf-8") as f:
-        full_cfg = json.load(f)
-
-    model = UniDepthV2(full_cfg)
-
-    if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    state_dict = load_safetensors_file(checkpoint_path)
-    load_info = model.load_state_dict(state_dict, strict=False)
-    if len(load_info.missing_keys) > 0:
-        print(f"Warning: missing keys: {len(load_info.missing_keys)}")
-    if len(load_info.unexpected_keys) > 0:
-        print(f"Warning: unexpected keys: {len(load_info.unexpected_keys)}")
-
+# ── Model ─────────────────────────────────────────────────────────────────────
+def load_model(ckpt, cfg_path, device):
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    model = UniDepthV2(cfg)
+    sd = load_safetensors_file(ckpt)
+    model.load_state_dict(sd, strict=False)
     model = model.to(device).eval()
+    model.resolution_level = 9
+    variant = "ViT-S" if "vits" in ckpt.lower() else "ViT-L"
+    print(f"[model] UniDepthV2 {variant} ready on {device}")
+    model._variant_label = f"UniDepthV2 {variant}"
     return model
 
-
-def lidar_to_camera_points(
-    nusc: NuScenes,
-    lidar_token: str,
-    camera_token: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    sd_lidar = nusc.get("sample_data", lidar_token)
-    sd_cam = nusc.get("sample_data", camera_token)
-
-    cs_lidar = nusc.get("calibrated_sensor", sd_lidar["calibrated_sensor_token"])
-    pose_lidar = nusc.get("ego_pose", sd_lidar["ego_pose_token"])
-
-    cs_cam = nusc.get("calibrated_sensor", sd_cam["calibrated_sensor_token"])
-    pose_cam = nusc.get("ego_pose", sd_cam["ego_pose_token"])
-
-    pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, sd_lidar["filename"]))
-
-    pc.rotate(Quaternion(cs_lidar["rotation"]).rotation_matrix)
-    pc.translate(np.array(cs_lidar["translation"]))
-
-    pc.rotate(Quaternion(pose_lidar["rotation"]).rotation_matrix)
-    pc.translate(np.array(pose_lidar["translation"]))
-
-    pc.translate(-np.array(pose_cam["translation"]))
-    pc.rotate(Quaternion(pose_cam["rotation"]).rotation_matrix.T)
-
-    pc.translate(-np.array(cs_cam["translation"]))
-    pc.rotate(Quaternion(cs_cam["rotation"]).rotation_matrix.T)
-
-    points_cam = pc.points[:3, :]
-    depths = points_cam[2, :]
-
-    intrinsic = np.array(cs_cam["camera_intrinsic"], dtype=np.float32)
-    points_img = view_points(points_cam, intrinsic, normalize=True)
-    u = points_img[0, :]
-    v = points_img[1, :]
-
-    return points_cam, depths, u, v, intrinsic
-
-
-def build_sparse_depth_map(
-    image_h: int,
-    image_w: int,
-    depths: np.ndarray,
-    u: np.ndarray,
-    v: np.ndarray,
-    min_depth_m: float = 0.1,
-) -> np.ndarray:
-    sparse = np.zeros((image_h, image_w), dtype=np.float32)
-    valid = (
-        (depths > min_depth_m)
-        & (u >= 0)
-        & (u < image_w)
-        & (v >= 0)
-        & (v < image_h)
-    )
-
-    uu = np.floor(u[valid]).astype(np.int32)
-    vv = np.floor(v[valid]).astype(np.int32)
-    uu = np.clip(uu, 0, image_w - 1)
-    vv = np.clip(vv, 0, image_h - 1)
-    dd = depths[valid].astype(np.float32)
-
-    for x, y, d in zip(uu, vv, dd):
-        existing = sparse[y, x]
-        if existing == 0.0 or d < existing:
-            sparse[y, x] = d
-
-    return sparse
-
-
-def infer_metric_depth(
-    model: UniDepthV2,
-    image_bgr: np.ndarray,
-    intrinsic: np.ndarray,
-    intrinsics_mode: str = "tensor",
-) -> np.ndarray:
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    rgb = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous()
-    K = torch.from_numpy(intrinsic.astype(np.float32))
-
+def infer(model, image_bgr, intrinsic, device):
+    rgb = torch.from_numpy(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)).permute(2,0,1).contiguous()
+    K   = torch.from_numpy(intrinsic.astype(np.float32))
     with torch.inference_mode():
-        if intrinsics_mode == "none":
-            pred = model.infer(rgb)
-        elif intrinsics_mode == "tensor":
-            pred = model.infer(rgb, K)
-        elif intrinsics_mode == "pinhole":
-            camera = Pinhole(K=K)
-            pred = model.infer(rgb, camera)
-        else:
-            raise ValueError(f"Unsupported intrinsics mode: {intrinsics_mode}")
+        pred = model.infer(rgb, Pinhole(K=K))
+    d = pred.get("depth", pred.get("radius")).detach().float().cpu().numpy()
+    while d.ndim > 2: d = d.squeeze(0)
+    return d.astype(np.float32)
 
-    depth_tensor = pred.get("depth", None)
-    if depth_tensor is None:
-        depth_tensor = pred["radius"]
+def infer_guarded(model, image_bgr, intrinsic, device, stats):
+    """infer() with recovery from UniDepthV2's transient all-invalid CUDA output.
 
-    depth = depth_tensor.detach().float().cpu().numpy()
-    while depth.ndim > 2:
-        depth = np.squeeze(depth, axis=0)
+    UniDepthV2's CUDA path intermittently returns a depth map that is entirely
+    non-finite or non-positive. Without a guard the frame scores valid_pixels=0
+    and silently vanishes from frame_metrics.csv — this cost the 2026-06 run 840
+    of 16,182 frames on ViT-S and 101 on ViT-L, and the lost frames were harder
+    than average, so the reported MAE was optimistic.
 
-    if not np.any(np.isfinite(depth) & (depth > 0)) and "radius" in pred:
-        radius = pred["radius"].detach().float().cpu().numpy()
-        while radius.ndim > 2:
-            radius = np.squeeze(radius, axis=0)
-        depth = radius
+    The same guard exists in nuscenes_unidepthv2_intrinsics_demo.py and in the
+    Paper-1 eval script; it was dropped when this script was written.
 
-    return depth.astype(np.float32)
+    Recovery order differs from those scripts deliberately. They switch to CPU
+    permanently on first failure, which is fine for a short demo but would add
+    days to a 16k-frame benchmark. The failure is transient — re-running the lost
+    frames reproduces none of them — so retry on the same device first and use
+    CPU only for the offending frame.
+    """
+    def usable(d):
+        return bool(np.any(np.isfinite(d) & (d > 0)))
 
+    d = infer(model, image_bgr, intrinsic, device)
+    if usable(d):
+        return d
 
-def infer_with_fallback(
-    model: UniDepthV2,
-    image_bgr: np.ndarray,
-    intrinsic: np.ndarray,
-    device: torch.device,
-    cpu_fallback_enabled: bool,
-    intrinsics_mode: str,
-) -> Tuple[np.ndarray, UniDepthV2, torch.device, bool]:
-    pred_metric = infer_metric_depth(model, image_bgr, intrinsic, intrinsics_mode=intrinsics_mode)
+    stats["retry"] += 1
+    d = infer(model, image_bgr, intrinsic, device)
+    if usable(d):
+        return d
 
-    if not np.any(np.isfinite(pred_metric) & (pred_metric > 0)) and device.type == "cuda":
-        if not cpu_fallback_enabled:
-            print(
-                f"Warning: CUDA inference produced invalid depth for mode={intrinsics_mode}. "
-                "Falling back to CPU inference."
-            )
-            model = model.to("cpu").eval()
-            device = torch.device("cpu")
-            cpu_fallback_enabled = True
-        pred_metric = infer_metric_depth(model, image_bgr, intrinsic, intrinsics_mode=intrinsics_mode)
+    # Still invalid: CPU is deterministic here. Move back afterwards regardless.
+    stats["cpu_fallback"] += 1
+    try:
+        model.to("cpu")
+        d = infer(model, image_bgr, intrinsic, torch.device("cpu"))
+    finally:
+        model.to(device)
+    if not usable(d):
+        stats["unrecovered"] += 1
+    return d
 
-    return pred_metric, model, device, cpu_fallback_enabled
+# ── nuScenes helpers ───────────────────────────────────────────────────────────
+def load_all_frames(nusc, camera, lidar, max_samples):
+    """Return (cam_sd_token, lid_sd_token) for ALL frames on disk (keyframes + sweeps)."""
+    pairs = []
+    for scene in nusc.scene:
+        first = nusc.get("sample", scene["first_sample_token"])
+        if camera not in first["data"] or lidar not in first["data"]: continue
+        lid_chain = []
+        lid_cur = nusc.get("sample_data", first["data"][lidar])
+        while True:
+            if os.path.isfile(os.path.join(nusc.dataroot, lid_cur["filename"])):
+                lid_chain.append((lid_cur["timestamp"], lid_cur["token"]))
+            if not lid_cur["next"]: break
+            lid_cur = nusc.get("sample_data", lid_cur["next"])
+        if not lid_chain: continue
+        lid_chain.sort(); lid_ts = [x[0] for x in lid_chain]; lid_toks = [x[1] for x in lid_chain]
+        cam_cur = nusc.get("sample_data", first["data"][camera])
+        while True:
+            if not cam_cur["is_key_frame"] and os.path.isfile(os.path.join(nusc.dataroot, cam_cur["filename"])):
+                idx = bisect.bisect_left(lid_ts, cam_cur["timestamp"])
+                best = min([i for i in (idx-1, idx, idx+1) if 0 <= i < len(lid_ts)],
+                           key=lambda i: abs(lid_ts[i] - cam_cur["timestamp"]))
+                pairs.append((cam_cur["token"], lid_toks[best]))
+            if max_samples > 0 and len(pairs) >= max_samples: return pairs
+            if not cam_cur["next"]: break
+            cam_cur = nusc.get("sample_data", cam_cur["next"])
+    return pairs
 
+def lidar_to_camera(nusc, lidar_token, cam_token):
+    sd_l = nusc.get("sample_data", lidar_token)
+    sd_c = nusc.get("sample_data", cam_token)
+    cs_l = nusc.get("calibrated_sensor", sd_l["calibrated_sensor_token"])
+    ep_l = nusc.get("ego_pose", sd_l["ego_pose_token"])
+    cs_c = nusc.get("calibrated_sensor", sd_c["calibrated_sensor_token"])
+    ep_c = nusc.get("ego_pose", sd_c["ego_pose_token"])
+    pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, sd_l["filename"]))
+    pc.rotate(Quaternion(cs_l["rotation"]).rotation_matrix)
+    pc.translate(np.array(cs_l["translation"]))
+    pc.rotate(Quaternion(ep_l["rotation"]).rotation_matrix)
+    pc.translate(np.array(ep_l["translation"]))
+    pc.translate(-np.array(ep_c["translation"]))
+    pc.rotate(Quaternion(ep_c["rotation"]).rotation_matrix.T)
+    pc.translate(-np.array(cs_c["translation"]))
+    pc.rotate(Quaternion(cs_c["rotation"]).rotation_matrix.T)
+    pts = pc.points[:3]
+    K   = np.array(cs_c["camera_intrinsic"], dtype=np.float32)
+    pi  = view_points(pts, K, normalize=True)
+    return pts[2], pi[0], pi[1], K
 
-def resolve_image_path(nusc_dataroot: str, filename: str) -> Optional[str]:
-    candidates = [
-        os.path.join(nusc_dataroot, filename),
-        os.path.join(nusc_dataroot, filename.replace("/samples/", "/sweeps/")),
-        os.path.join(nusc_dataroot, filename.replace("\\samples\\", "\\sweeps\\")),
-    ]
+def sparse_gt(h, w, depths, u, v, min_d=0.1):
+    gt = np.zeros((h, w), dtype=np.float32)
+    ok = (depths > min_d) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    uu = np.clip(np.floor(u[ok]).astype(int), 0, w-1)
+    vv = np.clip(np.floor(v[ok]).astype(int), 0, h-1)
+    for x, y, d in zip(uu, vv, depths[ok]):
+        if gt[y, x] == 0 or d < gt[y, x]:
+            gt[y, x] = d
+    return gt
 
-    base = os.path.basename(filename)
-    for folder in ("samples", "sweeps"):
-        candidates.append(os.path.join(nusc_dataroot, folder, "CAM_BACK", base))
+def compute_metrics(pred, gt, max_d):
+    ok = (gt > 0) & (gt <= max_d) & np.isfinite(pred) & (pred > 0)
+    p, g = pred[ok], gt[ok]
+    if p.size == 0:
+        return {"valid_pixels": 0, "mae_m": np.nan, "rmse_m": np.nan, "abs_rel": np.nan}, ok
+    ae = np.abs(p - g)
+    return {"valid_pixels": int(p.size),
+            "mae_m": float(np.mean(ae)),
+            "rmse_m": float(np.sqrt(np.mean((p-g)**2))),
+            "abs_rel": float(np.mean(ae / np.clip(g, 1e-6, None)))}, ok
 
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
+# ── Visualisation ─────────────────────────────────────────────────────────────
+def colorize(depth):
+    v = np.isfinite(depth);
+    if not v.any(): return np.zeros((*depth.shape,3), dtype=np.uint8)
+    lo, hi = np.percentile(depth[v], 2), np.percentile(depth[v], 98)
+    hi = max(hi, lo+1e-6)
+    n = np.clip((depth-lo)/(hi-lo), 0, 1)
+    c = matplotlib.colormaps.get_cmap("Spectral")
+    return (c((n*255).astype(np.uint8))[:,:,:3]*255).astype(np.uint8)[:,:,::-1]
 
-
-def compute_metrics(
-    pred_metric: np.ndarray,
-    gt_sparse_m: np.ndarray,
-    max_depth_m: float,
-) -> Tuple[Dict[str, float], np.ndarray]:
-    valid = (
-        (gt_sparse_m > 0.0)
-        & (gt_sparse_m <= max_depth_m)
-        & np.isfinite(pred_metric)
-        & (pred_metric > 0.0)
-        & (pred_metric <= max_depth_m)
-    )
-    pred = pred_metric[valid]
-    gt = gt_sparse_m[valid]
-
-    if pred.size == 0:
-        return {"valid_pixels": 0, "mae_m": np.nan, "rmse_m": np.nan, "abs_rel": np.nan}, valid
-
-    abs_err = np.abs(pred - gt)
-    mae = float(np.mean(abs_err))
-    rmse = float(np.sqrt(np.mean((pred - gt) ** 2)))
-    abs_rel = float(np.mean(abs_err / np.clip(gt, 1e-6, None)))
-    return {"valid_pixels": int(pred.size), "mae_m": mae, "rmse_m": rmse, "abs_rel": abs_rel}, valid
-
-
-def colorize_depth(depth_map: np.ndarray) -> np.ndarray:
-    d = depth_map.copy()
-    valid = np.isfinite(d)
-    if not np.any(valid):
-        return np.zeros((d.shape[0], d.shape[1], 3), dtype=np.uint8)
-
-    dmin = np.percentile(d[valid], 2)
-    dmax = np.percentile(d[valid], 98)
-    if dmax <= dmin:
-        dmax = dmin + 1e-6
-
-    d_norm = np.clip((d - dmin) / (dmax - dmin), 0.0, 1.0)
-    cmap = matplotlib.colormaps.get_cmap("Spectral")
-    colored = (cmap((d_norm * 255).astype(np.uint8))[:, :, :3] * 255).astype(np.uint8)
-    return colored[:, :, ::-1]
-
-
-def overlay_lidar_points(image_bgr: np.ndarray, sparse_depth_m: np.ndarray) -> np.ndarray:
-    out = image_bgr.copy()
-    ys, xs = np.where(sparse_depth_m > 0)
-    if ys.size == 0:
-        return out
-
-    depths = sparse_depth_m[ys, xs]
-    dmin = np.percentile(depths, 5)
-    dmax = np.percentile(depths, 95)
-    if dmax <= dmin:
-        dmax = dmin + 1e-6
-
-    for x, y, d in zip(xs, ys, depths):
-        t = float(np.clip((d - dmin) / (dmax - dmin), 0.0, 1.0))
-        color = (int(255 * (1.0 - t)), int(255 * t), 255)
-        cv2.circle(out, (int(x), int(y)), 1, color, -1)
-
+def overlay_lidar(img, gt):
+    out = img.copy()
+    ys, xs = np.where(gt > 0)
+    if ys.size == 0: return out
+    d = gt[ys, xs]
+    lo, hi = np.percentile(d,5), np.percentile(d,95); hi=max(hi,lo+1e-6)
+    for x, y, dd in zip(xs, ys, d):
+        t = float(np.clip((dd-lo)/(hi-lo),0,1))
+        cv2.circle(out,(int(x),int(y)),1,(int(255*(1-t)),int(255*t),255),-1)
     return out
 
+def evaluate_and_draw_boxes(img, pred, gt, yolo_model, conf_thr,
+                            max_obj_depth, frame_idx, cam_token):
+    """Run YOLO: draw boxes on img AND return box-level depth metrics."""
+    records = []
+    res = yolo_model(img, verbose=False)
+    if not res or res[0].boxes is None: return img, records
+    out = img.copy(); h, w = pred.shape
+    for box, conf, cls in zip(res[0].boxes.xyxy.cpu().numpy(),
+                               res[0].boxes.conf.cpu().numpy(),
+                               res[0].boxes.cls.cpu().numpy()):
+        if float(conf) < conf_thr: continue
+        x1,y1,x2,y2 = max(0,int(box[0])),max(0,int(box[1])),min(w,int(box[2])),min(h,int(box[3]))
+        if x2<=x1 or y2<=y1: continue
+        pv = pred[y1:y2,x1:x2]; gv = gt[y1:y2,x1:x2]
+        pv = pv[np.isfinite(pv)&(pv>0)]; gv = gv[gv>0]
+        if pv.size==0 or gv.size==0: continue
+        pm, gm = float(np.min(pv)), float(np.min(gv))
+        if max_obj_depth is not None and min(pm, gm) > max_obj_depth: continue
+        ae = abs(pm - gm)
+        name = res[0].names.get(int(cls), str(int(cls)))
+        cv2.rectangle(out,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(out,f"{name} p:{pm:.1f}m gt:{gm:.1f}m",(x1,max(20,y1-6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.42,(0,255,0),1,cv2.LINE_AA)
+        records.append({"frame_idx": frame_idx, "cam_token": cam_token,
+                        "class_name": name, "conf": float(conf),
+                        "pred_min_m": pm, "gt_min_m": gm,
+                        "abs_err_m": ae, "abs_rel": ae / max(gm, 1e-6)})
+    return out, records
 
-def evaluate_boxes(
-    pred_metric: np.ndarray,
-    gt_sparse_m: np.ndarray,
-    image_bgr: np.ndarray,
-    draw_image_bgr: np.ndarray,
-    yolo_model,
-    conf_threshold: float,
-    max_object_depth_m: Optional[float],
-    frame_idx: int,
-    sample_token: str,
-) -> List[Dict[str, float]]:
-    records: List[Dict[str, float]] = []
-    results = yolo_model(image_bgr, verbose=False)
-    if len(results) == 0:
-        return records
-
-    result = results[0]
-    if result.boxes is None:
-        return records
-
-    boxes = result.boxes.xyxy.cpu().numpy()
-    confs = result.boxes.conf.cpu().numpy()
-    clss = result.boxes.cls.cpu().numpy()
-    names = result.names if hasattr(result, "names") else {}
-
-    h, w = pred_metric.shape
-
-    for box, conf, cls_id in zip(boxes, confs, clss):
-        if float(conf) < conf_threshold:
-            continue
-
-        x1, y1, x2, y2 = box.astype(int)
-        x1 = max(0, min(w - 1, x1))
-        x2 = max(0, min(w, x2))
-        y1 = max(0, min(h - 1, y1))
-        y2 = max(0, min(h, y2))
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        pred_roi = pred_metric[y1:y2, x1:x2]
-        gt_roi = gt_sparse_m[y1:y2, x1:x2]
-
-        pred_valid = pred_roi[np.isfinite(pred_roi) & (pred_roi > 0)]
-        gt_valid = gt_roi[gt_roi > 0]
-        if pred_valid.size == 0 or gt_valid.size == 0:
-            continue
-
-        pred_min = float(np.min(pred_valid))
-        gt_min = float(np.min(gt_valid))
-
-        if max_object_depth_m is not None and min(pred_min, gt_min) > float(max_object_depth_m):
-            continue
-
-        abs_err = abs(pred_min - gt_min)
-        abs_rel = abs_err / max(gt_min, 1e-6)
-
-        class_name = names.get(int(cls_id), str(int(cls_id))) if isinstance(names, dict) else str(int(cls_id))
-
-        cv2.rectangle(draw_image_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"{class_name} p:{pred_min:.1f}m gt:{gt_min:.1f}m"
-        y_label = max(20, y1 - 8)
-        cv2.putText(draw_image_bgr, label, (x1, y_label), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-
-        records.append(
-            {
-                "frame_idx": int(frame_idx),
-                "sample_token": sample_token,
-                "class_id": int(cls_id),
-                "class_name": class_name,
-                "conf": float(conf),
-                "x1": int(x1),
-                "y1": int(y1),
-                "x2": int(x2),
-                "y2": int(y2),
-                "pred_min_m": pred_min,
-                "gt_min_m": gt_min,
-                "abs_err_m": abs_err,
-                "abs_rel": float(abs_rel),
-            }
-        )
-
-    return records
-
-
-def save_composite_output(
-    outdir: str,
-    idx: int,
-    lidar_overlay: np.ndarray,
-    pred_metric: np.ndarray,
-    metrics: Dict[str, float],
-    mode_label: str,
-) -> None:
+def save_composite(outdir, idx, left, pred, metrics, model_label="UniDepthV2"):
     os.makedirs(outdir, exist_ok=True)
-    depth_vis = colorize_depth(pred_metric)
-    composite = cv2.hconcat([lidar_overlay, depth_vis])
+    depth_vis = colorize(pred)
+    comp = cv2.hconcat([left, depth_vis])
+    lines = [model_label,
+             f"Valid px: {metrics['valid_pixels']}",
+             f"MAE : {metrics['mae_m']:.4f} m",
+             f"RMSE: {metrics['rmse_m']:.4f} m",
+             f"AbsRel: {metrics['abs_rel']:.4f}"]
+    font,fs,th,lh,pad = cv2.FONT_HERSHEY_SIMPLEX,0.55,1,22,10
+    bw = max(cv2.getTextSize(l,font,fs,th)[0][0] for l in lines)+pad*2
+    bh = lh*len(lines)+pad; x2=comp.shape[1]-20; y1=20
+    x1=max(0,x2-bw); y2=min(comp.shape[0],y1+bh)
+    ov=comp.copy(); cv2.rectangle(ov,(x1,y1),(x2,y2),(20,20,20),-1)
+    cv2.addWeighted(ov,0.75,comp,0.25,0,comp)
+    cv2.rectangle(comp,(x1,y1),(x2,y2),(255,255,255),1)
+    for i,l in enumerate(lines):
+        cv2.putText(comp,l,(x1+pad,y1+pad+(i+1)*lh-6),font,fs,(255,255,255),th,cv2.LINE_AA)
+    cv2.imwrite(os.path.join(outdir,f"{idx:04d}_composite.png"),comp)
 
-    table_lines = [
-        "Frame Metrics (UniDepthV2)",
-        f"Mode: {mode_label}",
-        "Scale: 1.0000 (metric)",
-        f"Valid px: {int(metrics['valid_pixels'])}",
-        f"MAE (m): {metrics['mae_m']:.4f}",
-        f"RMSE (m): {metrics['rmse_m']:.4f}",
-        f"AbsRel: {metrics['abs_rel']:.4f}",
-    ]
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    pa = argparse.ArgumentParser("UniDepthV2 CAM_FRONT consistent eval")
+    pa.add_argument("--dataroot",    default=DATAROOT)
+    pa.add_argument("--version",     default="v1.0-trainval")
+    pa.add_argument("--camera",      default="CAM_FRONT")
+    pa.add_argument("--lidar",       default="LIDAR_TOP")
+    pa.add_argument("--checkpoint",  default=DEFAULT_CKPT)
+    pa.add_argument("--config",      default=DEFAULT_CFG)
+    pa.add_argument("--max-depth-m", type=float, default=5.0)
+    pa.add_argument("--max-samples", type=int,   default=0)
+    pa.add_argument("--outdir",      default=DEFAULT_OUTDIR)
+    pa.add_argument("--use-yolo",          action="store_true")
+    pa.add_argument("--yolo-weights",      default=DEFAULT_YOLO)
+    pa.add_argument("--yolo-conf",         type=float, default=0.25)
+    pa.add_argument("--max-object-depth-m",type=float, default=5.0)
+    args = pa.parse_args()
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    thickness = 1
-    line_h = 24
-    padding = 12
+    device = get_device(); print(f"[device] {device}")
+    model  = load_model(args.checkpoint, args.config, device)
 
-    text_sizes = [cv2.getTextSize(line, font, font_scale, thickness)[0] for line in table_lines]
-    box_w = max(w for w, _ in text_sizes) + padding * 2
-    box_h = line_h * len(table_lines) + padding
-
-    x2 = composite.shape[1] - 20
-    y1 = 20
-    x1 = max(0, x2 - box_w)
-    y2 = min(composite.shape[0], y1 + box_h)
-
-    overlay = composite.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.75, composite, 0.25, 0, composite)
-    cv2.rectangle(composite, (x1, y1), (x2, y2), (255, 255, 255), 1)
-
-    for i, line in enumerate(table_lines):
-        y_text = y1 + padding + (i + 1) * line_h - 8
-        cv2.putText(composite, line, (x1 + padding, y_text), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-    output_path = os.path.join(outdir, f"{idx:04d}_composite.png")
-    cv2.imwrite(output_path, composite)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser("nuScenes trainval UniDepthV2 + YOLO + LiDAR demo")
-    parser.add_argument("--dataroot", type=str, default=r"C:\DataSet\v1.0-trainval02_blobs")
-    parser.add_argument("--version", type=str, default="v1.0-trainval")
-    parser.add_argument("--camera", type=str, default="CAM_BACK")
-    parser.add_argument("--lidar", type=str, default="LIDAR_TOP")
-    parser.add_argument("--checkpoint", type=str, default=r"C:\RVC\Weights\UniDepth\337d0ee1ac66673e7449612f8ddcf05636c9ad58270e00158705ffcab43822a1")
-    parser.add_argument("--config", type=str, default=r"C:\RVC\Weights\UniDepth\unidepth-v2-vitl14\config.json")
-    parser.add_argument("--max-samples", type=int, default=0)
-    parser.add_argument("--outdir", type=str, default=r"C:\RVC\OtherThanModel\Models'Output\UniDepthV2\trainval02_CAM_BACK_intrinsics_5m")
-    parser.add_argument(
-        "--intrinsics-mode",
-        type=str,
-        choices=["none", "tensor", "pinhole"],
-        default="pinhole",
-        help="Primary inference mode for camera intrinsics.",
-    )
-    parser.add_argument(
-        "--compare-intrinsics-impact",
-        action="store_true",
-        help="Also evaluate a baseline mode and save impact comparison files.",
-    )
-    parser.add_argument(
-        "--baseline-intrinsics-mode",
-        type=str,
-        choices=["none", "tensor", "pinhole"],
-        default="tensor",
-        help="Baseline mode used when --compare-intrinsics-impact is enabled.",
-    )
-    parser.add_argument("--use-yolo", action="store_true")
-    parser.add_argument("--yolo-weights", type=str, default=r"C:\RVC\Weights\Yolo_weights\yolo26s.pt")
-    parser.add_argument("--yolo-conf", type=float, default=0.25)
-    parser.add_argument("--max-depth-m", type=float, default=10.0)
-    parser.add_argument(
-        "--max-object-depth-m",
-        type=float,
-        default=5.0,
-        help="Keep YOLO box detections only when nearest depth is <= this threshold. Use negative value to disable.",
-    )
-    args = parser.parse_args()
-
-    device = get_device()
-    print(f"Using device: {device}")
-
-    model = load_unidepthv2_model(args.checkpoint, args.config, device)
-
-    nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=True)
-    sample_tokens = load_sample_tokens(nusc, args.camera, args.lidar, args.max_samples)
-    if len(sample_tokens) == 0:
-        raise RuntimeError(f"No samples found containing {args.camera} and {args.lidar}.")
+    nusc        = NuScenes(version=args.version, dataroot=args.dataroot, verbose=True)
+    frame_pairs = load_all_frames(nusc, args.camera, args.lidar, args.max_samples)
+    print(f"[nusc ] {len(frame_pairs)} sweep frames (keyframes excluded)")
 
     yolo_model = None
     if args.use_yolo:
-        if not os.path.isfile(args.yolo_weights):
-            raise FileNotFoundError(f"YOLO weights not found: {args.yolo_weights}")
+        from ultralytics import YOLO
         yolo_model = YOLO(args.yolo_weights)
+        print(f"[yolo ] {args.yolo_weights} (visualization only)")
 
-    max_object_depth_m: Optional[float] = args.max_object_depth_m if args.max_object_depth_m >= 0 else None
+    # Auto-increment run folder
+    base = os.path.normpath(args.outdir); n=1
+    while os.path.exists(os.path.join(base, f"run{n}")): n+=1
+    run_dir = os.path.join(base, f"run{n}"); os.makedirs(run_dir)
+    frame_dir = os.path.join(run_dir, "frames"); os.makedirs(frame_dir)
+    print(f"[out  ] {run_dir}")
 
-    cpu_fallback_enabled = False
+    frame_metrics=[]; box_records=[]; all_pred=[]; all_gt=[]
+    max_obj_depth = args.max_object_depth_m if args.max_object_depth_m >= 0 else None
+    # Counts how often the invalid-CUDA-output guard fired (see infer_guarded).
+    infer_stats = {"retry": 0, "cpu_fallback": 0, "unrecovered": 0}
 
-    frame_metrics: List[FrameMetrics] = []
-    baseline_frame_metrics: List[FrameMetrics] = []
-    impact_records: List[Dict[str, float]] = []
-    box_records: List[Dict[str, float]] = []
+    for idx, (ct, lt) in enumerate(frame_pairs):
+        sd  = nusc.get("sample_data", ct)
+        img = cv2.imread(os.path.join(nusc.dataroot, sd["filename"]))
+        if img is None: continue
 
-    all_pred: List[np.ndarray] = []
-    all_gt: List[np.ndarray] = []
-    baseline_all_pred: List[np.ndarray] = []
-    baseline_all_gt: List[np.ndarray] = []
+        depths, u, v, K = lidar_to_camera(nusc, lt, ct)
+        h, w = img.shape[:2]
+        gt = sparse_gt(h, w, depths, u, v)
+        pred = infer_guarded(model, img, K, device, infer_stats)
+        if pred.shape != (h,w):
+            pred = cv2.resize(pred, (w,h), interpolation=cv2.INTER_LINEAR)
 
-    frame_outdir = os.path.join(args.outdir, "frames")
-    os.makedirs(frame_outdir, exist_ok=True)
-
-    for idx, sample_token in enumerate(sample_tokens):
-        sample = nusc.get("sample", sample_token)
-        cam_token = sample["data"][args.camera]
-        lidar_token = sample["data"][args.lidar]
-
-        sd_cam = nusc.get("sample_data", cam_token)
-        image_path = resolve_image_path(nusc.dataroot, sd_cam["filename"])
-        if image_path is None:
-            continue
-        image_bgr = cv2.imread(image_path)
-        if image_bgr is None:
-            continue
-
-        _, depths, u, v, intrinsic = lidar_to_camera_points(nusc, lidar_token, cam_token)
-
-        h, w = image_bgr.shape[:2]
-        sparse_depth = build_sparse_depth_map(h, w, depths, u, v)
-        pred_metric, model, device, cpu_fallback_enabled = infer_with_fallback(
-            model,
-            image_bgr,
-            intrinsic,
-            device,
-            cpu_fallback_enabled,
-            intrinsics_mode=args.intrinsics_mode,
-        )
-
-        metrics, valid_mask = compute_metrics(pred_metric, sparse_depth, max_depth_m=float(args.max_depth_m))
-        frame_metrics.append(
-            FrameMetrics(
-                sample_token=sample_token,
-                camera_token=cam_token,
-                lidar_token=lidar_token,
-                valid_pixels=metrics["valid_pixels"],
-                mae_m=metrics["mae_m"],
-                rmse_m=metrics["rmse_m"],
-                abs_rel=metrics["abs_rel"],
-            )
-        )
-
+        metrics, ok = compute_metrics(pred, gt, args.max_depth_m)
+        frame_metrics.append(FrameMetrics(ct, metrics["valid_pixels"],
+                                          metrics["mae_m"], metrics["rmse_m"], metrics["abs_rel"]))
         if metrics["valid_pixels"] > 0:
-            all_pred.append(pred_metric[valid_mask])
-            all_gt.append(sparse_depth[valid_mask])
+            all_pred.append(pred[ok]); all_gt.append(gt[ok])
 
-        baseline_metrics: Optional[Dict[str, float]] = None
-        if args.compare_intrinsics_impact:
-            baseline_pred_metric, model, device, cpu_fallback_enabled = infer_with_fallback(
-                model,
-                image_bgr,
-                intrinsic,
-                device,
-                cpu_fallback_enabled,
-                intrinsics_mode=args.baseline_intrinsics_mode,
-            )
-            baseline_metrics, baseline_valid_mask = compute_metrics(
-                baseline_pred_metric,
-                sparse_depth,
-                max_depth_m=float(args.max_depth_m),
-            )
-            baseline_frame_metrics.append(
-                FrameMetrics(
-                    sample_token=sample_token,
-                    camera_token=cam_token,
-                    lidar_token=lidar_token,
-                    valid_pixels=baseline_metrics["valid_pixels"],
-                    mae_m=baseline_metrics["mae_m"],
-                    rmse_m=baseline_metrics["rmse_m"],
-                    abs_rel=baseline_metrics["abs_rel"],
-                )
-            )
-            if baseline_metrics["valid_pixels"] > 0:
-                baseline_all_pred.append(baseline_pred_metric[baseline_valid_mask])
-                baseline_all_gt.append(sparse_depth[baseline_valid_mask])
-
-            impact_records.append(
-                {
-                    "frame_idx": int(idx),
-                    "sample_token": sample_token,
-                    "primary_mode": args.intrinsics_mode,
-                    "baseline_mode": args.baseline_intrinsics_mode,
-                    "primary_valid_pixels": int(metrics["valid_pixels"]),
-                    "baseline_valid_pixels": int(baseline_metrics["valid_pixels"]),
-                    "primary_mae_m": float(metrics["mae_m"]),
-                    "baseline_mae_m": float(baseline_metrics["mae_m"]),
-                    "delta_mae_m": float(metrics["mae_m"] - baseline_metrics["mae_m"]),
-                    "primary_rmse_m": float(metrics["rmse_m"]),
-                    "baseline_rmse_m": float(baseline_metrics["rmse_m"]),
-                    "delta_rmse_m": float(metrics["rmse_m"] - baseline_metrics["rmse_m"]),
-                    "primary_abs_rel": float(metrics["abs_rel"]),
-                    "baseline_abs_rel": float(baseline_metrics["abs_rel"]),
-                    "delta_abs_rel": float(metrics["abs_rel"] - baseline_metrics["abs_rel"]),
-                }
-            )
-
-        lidar_overlay_vis = overlay_lidar_points(image_bgr, sparse_depth)
-        frame_box_records: List[Dict[str, float]] = []
+        # YOLO: visualization only — does NOT affect which frames are evaluated
+        vis = overlay_lidar(img, gt)
         if yolo_model is not None:
-            frame_box_records = evaluate_boxes(
-                pred_metric,
-                sparse_depth,
-                image_bgr,
-                lidar_overlay_vis,
-                yolo_model,
-                args.yolo_conf,
-                max_object_depth_m,
-                idx,
-                sample_token,
-            )
-            box_records.extend(frame_box_records)
-            if len(frame_box_records) == 0:
-                continue
+            vis, recs = evaluate_and_draw_boxes(vis, pred, gt, yolo_model,
+                                                args.yolo_conf, max_obj_depth,
+                                                idx, ct)
+            box_records.extend(recs)
 
-        save_composite_output(
-            frame_outdir,
-            idx,
-            lidar_overlay_vis,
-            pred_metric,
-            metrics,
-            mode_label=args.intrinsics_mode,
-        )
+        save_composite(frame_dir, idx, vis, pred, metrics, model._variant_label)
 
-    os.makedirs(args.outdir, exist_ok=True)
-    per_frame_df = pd.DataFrame([fm.__dict__ for fm in frame_metrics])
-    per_frame_df.to_csv(os.path.join(args.outdir, "per_frame_metrics.csv"), index=False)
+        if idx % 10 == 0:
+            print(f"  [{idx:04d}] valid={metrics['valid_pixels']:5d} "
+                  f"MAE={metrics['mae_m']:.4f} RMSE={metrics['rmse_m']:.4f} AbsRel={metrics['abs_rel']:.4f}")
 
-    if len(all_pred) > 0:
-        pred_all = np.concatenate(all_pred)
-        gt_all = np.concatenate(all_gt)
-        valid = np.isfinite(pred_all) & np.isfinite(gt_all) & (gt_all > 0)
-        pred_all = pred_all[valid]
-        gt_all = gt_all[valid]
+    # ── Summary ───────────────────────────────────────────────────────────────
+    df = pd.DataFrame([{"sample_token":m.sample_token,"valid_pixels":m.valid_pixels,
+                        "mae_m":m.mae_m,"rmse_m":m.rmse_m,"abs_rel":m.abs_rel}
+                       for m in frame_metrics if m.valid_pixels>0])
+    df.to_csv(os.path.join(run_dir,"frame_metrics.csv"),index=False)
 
-        abs_err = np.abs(pred_all - gt_all)
-        summary = {
-            "num_frames": int(len(frame_metrics)),
-            "valid_pixels": int(pred_all.size),
-            "mae_m": float(np.mean(abs_err)),
-            "rmse_m": float(np.sqrt(np.mean((pred_all - gt_all) ** 2))),
-            "abs_rel": float(np.mean(abs_err / np.clip(gt_all, 1e-6, None))),
-        }
-    else:
-        summary = {
-            "num_frames": int(len(frame_metrics)),
-            "valid_pixels": 0,
-            "mae_m": np.nan,
-            "rmse_m": np.nan,
-            "abs_rel": np.nan,
-        }
+    if all_pred:
+        pc=np.concatenate(all_pred); gc=np.concatenate(all_gt); ae=np.abs(pc-gc)
+        summary={"model":model._variant_label,"camera":args.camera,
+                 "max_depth_m":args.max_depth_m,"n_frames":len(frame_metrics),
+                 "n_valid_frames":int(df.shape[0]),"total_pixels":int(pc.size),
+                 "mae_m":float(np.mean(ae)),
+                 "rmse_m":float(np.sqrt(np.mean((pc-gc)**2))),
+                 "abs_rel":float(np.mean(ae/np.clip(gc,1e-6,None))),
+                 "median_ae_m":float(np.median(ae)),
+                 # Provenance of the invalid-CUDA-output guard, so the run is
+                 # self-documenting and comparable against the 2026-06 numbers.
+                 "invalid_infer_retries":infer_stats["retry"],
+                 "invalid_infer_cpu_fallbacks":infer_stats["cpu_fallback"],
+                 "invalid_infer_unrecovered":infer_stats["unrecovered"]}
+        print("\n"+"="*55+f"\nSUMMARY — {model._variant_label}  {args.camera}\n"+"="*55)
+        print(tabulate([[k,f"{v:.4f}"if isinstance(v,float)else v]
+                        for k,v in summary.items()],
+                       headers=["Metric","Value"],tablefmt="grid"))
+        pd.DataFrame([summary]).to_csv(os.path.join(run_dir,"summary_metrics.csv"),index=False)
 
-    with open(os.path.join(args.outdir, "summary_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    if box_records:
+        bdf = pd.DataFrame(box_records)
+        bdf.to_csv(os.path.join(run_dir,"box_metrics.csv"),index=False)
+        box_summary = {"n_detections": len(bdf),
+                       "mae_nearest_m": float(bdf["abs_err_m"].mean()),
+                       "median_nearest_m": float(bdf["abs_err_m"].median())}
+        pd.DataFrame([box_summary]).to_csv(os.path.join(run_dir,"box_summary.csv"),index=False)
+        print(f"\nObject-level: {len(bdf)} detections  MAE={bdf['abs_err_m'].mean():.4f}m")
 
-    summary_df = pd.DataFrame([summary])
-    summary_df.to_csv(os.path.join(args.outdir, "summary_metrics.csv"), index=False)
+    # ── Invalid-inference guard report ────────────────────────────────────────
+    n_zero = sum(1 for m in frame_metrics if m.valid_pixels == 0)
+    n_done = len(frame_metrics)
+    # The other five configs lose 51 of 16,182 frames to genuinely empty GT.
+    # Scale that rate to however many frames this run actually processed, so the
+    # figure is meaningful on --max-samples runs too.
+    baseline_expected = 51.0 / 16182.0 * n_done
+    print("\n" + "=" * 55 + "\nINVALID-INFERENCE GUARD\n" + "=" * 55)
+    print(f"  frames processed          : {n_done}")
+    print(f"  frames with 0 valid pixels: {n_zero}   "
+          f"(expected ~{baseline_expected:.0f} at this frame count = no LiDAR "
+          f"return in 0-{args.max_depth_m:.0f} m)")
+    print(f"  transient CUDA failures   : {infer_stats['retry']}")
+    print(f"  needed CPU fallback       : {infer_stats['cpu_fallback']}")
+    print(f"  unrecovered               : {infer_stats['unrecovered']}")
+    if infer_stats["retry"] or infer_stats["cpu_fallback"]:
+        print(f"  -> the guard rescued {infer_stats['retry'] + infer_stats['cpu_fallback']} "
+              f"frame(s) that the 2026-06 run would have dropped silently.")
+    elif n_done < 2000:
+        print("  -> guard did not fire; at this sample size that is expected "
+              "(~0.6% of frames failed in the 2026-06 run).")
+    if n_zero > 2 * baseline_expected + 10:
+        print("  !! well above the expected baseline - investigate before using these numbers.")
 
-    summary_table = tabulate(
-        [[summary["num_frames"], summary["valid_pixels"], summary["mae_m"], summary["rmse_m"], summary["abs_rel"]]],
-        headers=["num_frames", "valid_pixels", "mae_m", "rmse_m", "abs_rel"],
-        tablefmt="github",
-        floatfmt=".4f",
-    )
-    with open(os.path.join(args.outdir, "summary_table.txt"), "w", encoding="utf-8") as f:
-        f.write(summary_table + "\n")
-
-    print("\n=== Aggregate Metrics ===")
-    print(summary_table)
-
-    if args.compare_intrinsics_impact:
-        baseline_per_frame_df = pd.DataFrame([fm.__dict__ for fm in baseline_frame_metrics])
-        baseline_per_frame_df.to_csv(
-            os.path.join(args.outdir, f"per_frame_metrics_{args.baseline_intrinsics_mode}.csv"),
-            index=False,
-        )
-
-        if len(baseline_all_pred) > 0:
-            base_pred_all = np.concatenate(baseline_all_pred)
-            base_gt_all = np.concatenate(baseline_all_gt)
-            base_valid = np.isfinite(base_pred_all) & np.isfinite(base_gt_all) & (base_gt_all > 0)
-            base_pred_all = base_pred_all[base_valid]
-            base_gt_all = base_gt_all[base_valid]
-
-            base_abs_err = np.abs(base_pred_all - base_gt_all)
-            baseline_summary = {
-                "num_frames": int(len(baseline_frame_metrics)),
-                "valid_pixels": int(base_pred_all.size),
-                "mae_m": float(np.mean(base_abs_err)),
-                "rmse_m": float(np.sqrt(np.mean((base_pred_all - base_gt_all) ** 2))),
-                "abs_rel": float(np.mean(base_abs_err / np.clip(base_gt_all, 1e-6, None))),
-            }
-        else:
-            baseline_summary = {
-                "num_frames": int(len(baseline_frame_metrics)),
-                "valid_pixels": 0,
-                "mae_m": np.nan,
-                "rmse_m": np.nan,
-                "abs_rel": np.nan,
-            }
-
-        impact_summary = {
-            "primary_mode": args.intrinsics_mode,
-            "baseline_mode": args.baseline_intrinsics_mode,
-            "primary": summary,
-            "baseline": baseline_summary,
-            "delta_primary_minus_baseline": {
-                "mae_m": float(summary["mae_m"] - baseline_summary["mae_m"]),
-                "rmse_m": float(summary["rmse_m"] - baseline_summary["rmse_m"]),
-                "abs_rel": float(summary["abs_rel"] - baseline_summary["abs_rel"]),
-            },
-        }
-
-        with open(os.path.join(args.outdir, "intrinsics_impact_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(impact_summary, f, indent=2)
-
-        pd.DataFrame(impact_records).to_csv(
-            os.path.join(args.outdir, "intrinsics_impact_per_frame.csv"),
-            index=False,
-        )
-
-        impact_table = tabulate(
-            [
-                [
-                    args.intrinsics_mode,
-                    summary["valid_pixels"],
-                    summary["mae_m"],
-                    summary["rmse_m"],
-                    summary["abs_rel"],
-                ],
-                [
-                    args.baseline_intrinsics_mode,
-                    baseline_summary["valid_pixels"],
-                    baseline_summary["mae_m"],
-                    baseline_summary["rmse_m"],
-                    baseline_summary["abs_rel"],
-                ],
-            ],
-            headers=["mode", "valid_pixels", "mae_m", "rmse_m", "abs_rel"],
-            tablefmt="github",
-            floatfmt=".4f",
-        )
-        with open(os.path.join(args.outdir, "intrinsics_impact_table.txt"), "w", encoding="utf-8") as f:
-            f.write(impact_table + "\n")
-
-        print("\n=== Intrinsics Impact Comparison ===")
-        print(impact_table)
-
-    if len(box_records) > 0:
-        box_df = pd.DataFrame(box_records)
-        box_df.to_csv(os.path.join(args.outdir, "obstacle_box_metrics.csv"), index=False)
-
-        abs_err = box_df["abs_err_m"].to_numpy()
-        gt_min = box_df["gt_min_m"].to_numpy()
-        box_summary = {
-            "num_boxes": int(len(box_df)),
-            "mae_min_depth_m": float(np.mean(abs_err)),
-            "rmse_min_depth_m": float(np.sqrt(np.mean(abs_err**2))),
-            "abs_rel_min_depth": float(np.mean(abs_err / np.clip(gt_min, 1e-6, None))),
-        }
-        with open(os.path.join(args.outdir, "obstacle_box_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(box_summary, f, indent=2)
-
+    print(f"\n[done] {run_dir}")
 
 if __name__ == "__main__":
     main()

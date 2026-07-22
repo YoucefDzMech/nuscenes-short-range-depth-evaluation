@@ -1,2 +1,2 @@
-model,metric_formula,K_source,max_depth_m,num_frames,valid_pixels,mae_m,rmse_m,abs_rel
-Metric3D-v2,native metric (ViT-Giant2 encoder + RAFTDepthNormalDPTDecoder5),nuScenes intrinsic matrix (full 3x3),5.0,1150,973142,0.1901923418045044,1.323002576828003,0.24350950121879578
+model,camera,max_depth_m,num_frames,valid_pixels,mae_m,rmse_m,abs_rel,median_ae_m
+Metric3D-v2-ViT-Giant2,CAM_FRONT,5.0,16182,3180194,0.2459141,1.91676712,0.06037422,0.14600801

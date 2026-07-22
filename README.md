@@ -1,6 +1,6 @@
 # Intrinsics-Aware Comparison of Foundation Monocular Depth Estimators for Short-Range Obstacle Detection in Automotive Applications
 
-IEEE MetroAutomotive 2026 — evaluation repository.
+Evaluation repository for the paper (AEIT 2026).
 
 ## Scope
 This repository is **evaluation-only**. It does not include model architectures, training code, or model weights.
@@ -19,10 +19,12 @@ Not included:
 
 ## Evaluation setup
 - Dataset split: `nuScenes trainval02`
-- Camera: `CAM_BACK` (1600×900, \(f_x \approx 1266\) px)
-- Ground-truth source: `LIDAR_TOP` projected to image plane
-- Evaluation range: \(0 < d \le 5\,m\)
+- Camera: `CAM_FRONT` (1600×900, \(f_x \approx 1266\) px) — the rear camera (`CAM_BACK`) is not used because the roof LiDAR returns off the ego bumper at ~0.2 m contaminate the ground truth at short range.
+- Frames: **16,182 forward-camera sweep frames**, evaluated identically across all three models (16,131 contain valid in-range ground truth).
+- Ground-truth source: `LIDAR_TOP` projected to image plane.
+- Evaluation range: \(0 < d \le 5\,m\).
 - LiDAR is **evaluation-only** and never used as model input.
+- Valid-pixel mask: `gt in (0, 5] m` and prediction finite and positive. **No upper bound is placed on the prediction** — capping predictions to the range would discard exactly the pixels where a model most over-estimates, removing its largest errors from its own statistics (see Corrections below).
 
 ### Evaluation pipeline
 ![Evaluation pipeline](figures/fig1_pipeline.png)
@@ -40,24 +42,32 @@ The scripts run each model on RGB images, compute sparse LiDAR-based depth metri
 - [requirements](requirements)
 - [figures](figures)
 
-## Example qualitative frames (trainval02 CAM_BACK)
+## Example qualitative frames (trainval02 CAM_FRONT)
 Five generated composite examples per model are included:
 - [figures/examples/unidepthv2](figures/examples/unidepthv2)
 - [figures/examples/da3](figures/examples/da3)
 - [figures/examples/metric3d](figures/examples/metric3d)
 
-Included frame IDs: `3382`, `3385`, `3401`, `3402`, `3403`.
+Included frame IDs: `7008`, `12809`, `13838`, `15810`, `15885`.
 
 ## Key reported results
-Pixel-level (summary metrics, 0–5 m):
-- UniDepthV2: MAE 0.138 m, RMSE 0.277 m, AbsRel 11.5%
-- Metric3D-v2: MAE 0.190 m, RMSE 1.323 m, AbsRel 24.4%
-- DA3: MAE 0.376 m, RMSE 1.145 m, AbsRel 25.4%
+Pixel-level (summary metrics, CAM_FRONT, 16,182 frames, 0–5 m):
 
-Object-level (nearest-depth in YOLO boxes):
-- DA3: box MAE 0.726 m
-- UniDepthV2: box MAE 0.749 m
-- Metric3D-v2: box MAE 0.915 m
+| Model | MAE (m) | RMSE (m) | AbsRel | MedianAE (m) |
+|---|---|---|---|---|
+| UniDepthV2 (ViT-L) | **0.222** | 2.640 | **5.35%** | **0.095** |
+| Metric3D-v2 (ViT-Giant2) | 0.246 | **1.917** | 6.04% | 0.146 |
+| DA3 (Metric-Large) | 0.636 | 1.648 | 14.37% | 0.503 |
+
+Object-level nearest-depth (YOLO boxes):
+
+| Model | Boxes | Box MAE (m) | Box median (m) |
+|---|---|---|---|
+| UniDepthV2 | 2,371 | **0.845** | **0.126** |
+| Metric3D-v2 | 2,371 | 0.897 | 0.230 |
+| DA3 | 2,274 | 0.927 | 0.585 |
+
+**Finding:** the two strategies that integrate intrinsics into the network's computation — per-layer K conditioning (UniDepthV2) and canonical-space normalization (Metric3D-v2) — reach near-equivalent short-range accuracy, while post-hoc focal-length scaling (DA3) is substantially weaker. UniDepthV2 leads at both the pixel and object level. Across all models RMSE far exceeds MAE, indicating occasional large-magnitude errors that a safety-oriented deployment must account for.
 
 ## Generate comparison figure
 From repository root:
@@ -67,6 +77,14 @@ python eval/plot_results.py
 ```
 
 This writes [figures/fig3_metric_comparison.png](figures/fig3_metric_comparison.png).
+
+## Corrections (July 2026)
+The results and scripts in this repository were revised after two issues were identified and fixed:
+
+1. **Valid-pixel mask (UniDepthV2 script).** The mask previously required `pred <= max_depth` in addition to the ground-truth range condition. This discarded pixels where the model predicted beyond the 5 m range even though the ground truth was in range — i.e. the model's own largest over-estimates were removed from its statistics, and models were not comparable. The condition was removed so that all three scripts apply the same mask (`gt in (0,5] m` and prediction finite and positive). See `eval/nuscenes_unidepthv2_eval.py`, `compute_metrics`.
+2. **Camera and frame set.** Evaluation moved from `CAM_BACK` to `CAM_FRONT` (rear-bumper occlusion) and to a single shared set of 16,182 sweep frames for every model, replacing the earlier per-model frame subsets.
+
+Both changes make the evaluation consistent and comparable across models; the numbers in this README reflect the corrected protocol.
 
 ## Reproducibility notes
 Each model has its own requirements file:

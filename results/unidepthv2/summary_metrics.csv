@@ -1,2 +1,2 @@
-num_frames,valid_pixels,mae_m,rmse_m,abs_rel
-3367,2371184,0.13810274004936218,0.2770611345767975,0.11497494578361511
+model,camera,max_depth_m,num_frames,valid_pixels,mae_m,rmse_m,abs_rel,median_ae_m
+UniDepthV2-ViT-L,CAM_FRONT,5.0,16182,3180194,0.22228406,2.64049387,0.05354252,0.09548378

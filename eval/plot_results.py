@@ -48,7 +48,7 @@ def main():
     axes[1].set_ylabel("MAE (m)")
     axes[1].grid(axis="y", alpha=0.25)
 
-    fig.suptitle("Intrinsics-aware comparison on nuScenes trainval02 (CAM_BACK)")
+    fig.suptitle("Intrinsics-aware comparison on nuScenes trainval02 (CAM_FRONT)")
     fig.tight_layout()
     fig.savefig(fig_out, bbox_inches="tight")
     print(f"Saved: {fig_out}")

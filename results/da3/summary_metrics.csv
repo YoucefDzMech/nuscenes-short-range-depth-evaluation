@@ -1,0 +1,2 @@
+model,camera,max_depth_m,num_frames,valid_pixels,mae_m,rmse_m,abs_rel,median_ae_m
+DA3-Metric-Large,CAM_FRONT,5.0,16182,3180195,0.63606089,1.64824474,0.14371288,0.50276232

@@ -9,12 +9,12 @@ Weights/
 NUsCENES_DATASET/
 data/
 
-# Virtual environments
+# Virtual environments (root-anchored so they do NOT match results/da3, figures/examples/da3, etc.)
 venv*/
 .venv/
-DA3/
-Uni/
-M3D/
+/DA3/
+/Uni/
+/M3D/
 
 # Python cache
 __pycache__/

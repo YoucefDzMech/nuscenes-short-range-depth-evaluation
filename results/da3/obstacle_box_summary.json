@@ -1,0 +1,7 @@
+{
+  "num_boxes": 2274,
+  "mae_min_depth_m": 0.92665186,
+  "rmse_min_depth_m": 2.874,
+  "median_min_depth_m": 0.58526802,
+  "note": "Box AbsRel omitted: near-zero GT at object level makes it an uninformative artefact."
+}
